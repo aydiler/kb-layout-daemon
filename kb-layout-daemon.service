@@ -4,7 +4,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/kb-layout-daemon
+ExecStart=/usr/bin/kb-layout-daemon
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
