@@ -1,0 +1,13 @@
+[Unit]
+Description=Keyboard Layout Daemon - Auto-switch layout per keyboard
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/kb-layout-daemon
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

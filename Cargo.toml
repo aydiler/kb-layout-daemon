@@ -1,0 +1,27 @@
+[package]
+name = "kb-layout-daemon"
+version = "0.1.0"
+edition = "2021"
+authors = ["aydiler"]
+description = "Auto-switch keyboard layout based on which physical keyboard is used"
+license = "MIT"
+repository = "https://github.com/aydiler/kb-layout-daemon"
+homepage = "https://github.com/aydiler/kb-layout-daemon"
+keywords = ["keyboard", "layout", "kde", "wayland", "linux"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[dependencies]
+evdev = { version = "0.12", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+zbus = "4"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+
+[profile.release]
+lto = true
+strip = true
