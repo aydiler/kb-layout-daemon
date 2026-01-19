@@ -83,7 +83,11 @@ cargo install kb-layout-daemon
 
 A panel widget is included to toggle between Grab and Passive modes.
 
-### Install the widget
+### Install from KDE Store
+
+**[KB Layout Mode Toggle on KDE Store](https://store.kde.org/p/2342747/)**
+
+Or install manually:
 
 ```bash
 cp -r widget ~/.local/share/plasma/plasmoids/org.kblayout.toggle
