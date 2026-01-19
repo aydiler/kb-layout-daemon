@@ -1,6 +1,6 @@
 [package]
 name = "kb-layout-daemon"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["aydiler"]
 description = "Auto-switch keyboard layout based on which physical keyboard is used"
