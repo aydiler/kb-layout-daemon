@@ -1,16 +1,17 @@
-use evdev::{uinput::VirtualDeviceBuilder, AttributeSet, Device, EventType, InputEvent, InputEventKind, Key};
-use futures::stream::StreamExt;
+use evdev::{uinput::VirtualDeviceBuilder, AttributeSet, Device, EventType, InputEvent, InputEventKind, Key, MiscType, RelativeAxisType};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 use tracing::{error, info, warn};
-use zbus::{interface, Connection, ConnectionBuilder};
+use zbus::{blocking::Connection, interface};
 
 // Mode: true = Grab (correct first key), false = Passive (zero latency)
 static GRAB_MODE: AtomicBool = AtomicBool::new(true);
+static CURRENT_LAYOUT: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -116,34 +117,33 @@ fn find_keyboards(config: &Config) -> HashMap<PathBuf, (String, u32, String)> {
     keyboards
 }
 
-async fn switch_layout(conn: &Connection, layout_index: u32) -> Result<(), zbus::Error> {
-    let proxy = zbus::Proxy::new(
+fn switch_layout(conn: &Connection, layout_index: u32) -> Result<(), zbus::Error> {
+    let proxy = zbus::blocking::Proxy::new(
         conn,
         "org.kde.keyboard",
         "/Layouts",
         "org.kde.KeyboardLayouts",
-    )
-    .await?;
+    )?;
 
-    let result: bool = proxy.call("setLayout", &(layout_index,)).await?;
+    let result: bool = proxy.call("setLayout", &(layout_index,))?;
 
     if result {
+        CURRENT_LAYOUT.store(layout_index, Ordering::SeqCst);
         Ok(())
     } else {
         Err(zbus::Error::Failure("setLayout returned false".to_string()))
     }
 }
 
-async fn get_current_layout(conn: &Connection) -> Result<u32, zbus::Error> {
-    let proxy = zbus::Proxy::new(
+fn get_current_layout(conn: &Connection) -> Result<u32, zbus::Error> {
+    let proxy = zbus::blocking::Proxy::new(
         conn,
         "org.kde.keyboard",
         "/Layouts",
         "org.kde.KeyboardLayouts",
-    )
-    .await?;
+    )?;
 
-    proxy.call("getLayout", &()).await
+    proxy.call("getLayout", &())
 }
 
 fn create_virtual_keyboard() -> Result<evdev::uinput::VirtualDevice, std::io::Error> {
@@ -153,9 +153,24 @@ fn create_virtual_keyboard() -> Result<evdev::uinput::VirtualDevice, std::io::Er
         keys.insert(Key::new(i));
     }
 
+    // Add MSC types (for scan codes)
+    let mut misc = AttributeSet::<MiscType>::new();
+    misc.insert(MiscType::MSC_SCAN);
+
+    // Add relative axes (for keyboards with trackpads/scroll)
+    let mut rel = AttributeSet::<RelativeAxisType>::new();
+    rel.insert(RelativeAxisType::REL_X);
+    rel.insert(RelativeAxisType::REL_Y);
+    rel.insert(RelativeAxisType::REL_WHEEL);
+    rel.insert(RelativeAxisType::REL_HWHEEL);
+    rel.insert(RelativeAxisType::REL_WHEEL_HI_RES);
+    rel.insert(RelativeAxisType::REL_HWHEEL_HI_RES);
+
     VirtualDeviceBuilder::new()?
         .name("kb-layout-daemon virtual keyboard")
         .with_keys(&keys)?
+        .with_msc(&misc)?
+        .with_relative_axes(&rel)?
         .build()
 }
 
@@ -200,153 +215,136 @@ impl DaemonControl {
     }
 }
 
-struct SharedState {
-    current_layout: u32,
-    dbus_conn: Connection,
-    virtual_keyboard: evdev::uinput::VirtualDevice,
-}
+// Keyboard monitor - runs in its own thread with its own virtual keyboard
+fn monitor_keyboard(
+    path: PathBuf,
+    name: String,
+    layout_index: u32,
+    layout_name: String,
+    dbus_conn: Arc<Connection>,
+) {
+    info!("Starting monitor for '{}' at {:?}", name, path);
 
-// Event reader thread for grab mode
-fn read_events_blocking(path: PathBuf, tx: std::sync::mpsc::Sender<Vec<InputEvent>>, should_grab: Arc<AtomicBool>) {
+    // Create dedicated virtual keyboard for this physical keyboard
+    let mut virtual_kb = match create_virtual_keyboard() {
+        Ok(vk) => vk,
+        Err(e) => {
+            error!("Failed to create virtual keyboard for '{}': {}", name, e);
+            return;
+        }
+    };
+
+    let mut was_grab_mode = GRAB_MODE.load(Ordering::SeqCst);
+    let mut device: Option<Device> = None;
+
     loop {
-        let grab = should_grab.load(Ordering::SeqCst);
+        let is_grab_mode = GRAB_MODE.load(Ordering::SeqCst);
 
-        let mut device = match Device::open(&path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Failed to open {:?}: {}", path, e);
-                std::thread::sleep(std::time::Duration::from_secs(5));
+        // Handle mode changes - need to re-open device with different grab state
+        if device.is_none() || is_grab_mode != was_grab_mode {
+            // Release any held keys before switching
+            if let Some(ref mut dev) = device {
+                if was_grab_mode {
+                    // Send key release for all potentially pressed keys
+                    let release_events: Vec<InputEvent> = (0..256u16)
+                        .map(|code| InputEvent::new(EventType::KEY, code, 0))
+                        .collect();
+                    let _ = virtual_kb.emit(&release_events);
+                    // Send SYN
+                    let _ = virtual_kb.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)]);
+                }
+                drop(dev);
+            }
+            device = None;
+
+            // Open device
+            let mut dev = match Device::open(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Failed to open {:?}: {}, retrying...", path, e);
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+
+            // Grab if in grab mode
+            if is_grab_mode {
+                if let Err(e) = dev.grab() {
+                    warn!("Failed to grab {:?}: {}, retrying...", path, e);
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            }
+
+            device = Some(dev);
+            was_grab_mode = is_grab_mode;
+            info!(
+                "'{}' now in {} mode",
+                name,
+                if is_grab_mode { "GRAB" } else { "PASSIVE" }
+            );
+        }
+
+        // Read events in a block to limit borrow scope
+        let events: Option<Vec<InputEvent>> = {
+            let dev = device.as_mut().unwrap();
+            match dev.fetch_events() {
+                Ok(iter) => Some(iter.collect()),
+                Err(_) => None,
+            }
+        };
+
+        let events = match events {
+            Some(e) if !e.is_empty() => e,
+            Some(_) => continue,
+            None => {
+                // Device disconnected or error
+                warn!("Error reading from '{}', reconnecting...", name);
+                device = None;
+                thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
 
-        if grab {
-            if let Err(e) = device.grab() {
-                eprintln!("Failed to grab {:?}: {}", path, e);
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                continue;
-            }
-        }
+        // Check if we need to switch layout (on key press)
+        let current = CURRENT_LAYOUT.load(Ordering::SeqCst);
+        let mut need_switch = false;
 
-        loop {
-            // Check if mode changed
-            let new_grab = should_grab.load(Ordering::SeqCst);
-            if new_grab != grab {
-                break; // Reconnect with new mode
-            }
-
-            match device.fetch_events() {
-                Ok(events) => {
-                    let events: Vec<InputEvent> = events.collect();
-                    if tx.send(events).is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error reading from {:?}: {}", path, e);
+        for ev in &events {
+            if let InputEventKind::Key(_) = ev.kind() {
+                if ev.value() == 1 && current != layout_index {
+                    need_switch = true;
                     break;
                 }
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-async fn monitor_keyboard(
-    path: PathBuf,
-    name: String,
-    layout_index: u32,
-    layout_name: String,
-    state: Arc<Mutex<SharedState>>,
-) {
-    info!("Starting monitor for '{}' at {:?}", name, path);
-
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<InputEvent>>();
-    let rx = Arc::new(std::sync::Mutex::new(rx));
-    let should_grab = Arc::new(AtomicBool::new(GRAB_MODE.load(Ordering::SeqCst)));
-
-    let path_clone = path.clone();
-    let should_grab_clone = Arc::clone(&should_grab);
-    std::thread::spawn(move || {
-        read_events_blocking(path_clone, tx, should_grab_clone);
-    });
-
-    loop {
-        // Sync grab mode
-        should_grab.store(GRAB_MODE.load(Ordering::SeqCst), Ordering::SeqCst);
-
-        let rx_clone = Arc::clone(&rx);
-        let events = tokio::task::spawn_blocking(move || {
-            let rx = rx_clone.lock().unwrap();
-            rx.recv_timeout(std::time::Duration::from_millis(100)).ok()
-        })
-        .await;
-
-        let events = match events {
-            Ok(Some(events)) => events,
-            Ok(None) => continue,
-            Err(_) => {
-                warn!("Event reader task failed for '{}'", name);
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-
-        let is_grab_mode = GRAB_MODE.load(Ordering::SeqCst);
-
-        // First pass: check if we need to switch layout
-        let mut need_switch = false;
-        {
-            let state = state.lock().await;
-            for ev in &events {
-                if let InputEventKind::Key(_) = ev.kind() {
-                    if ev.value() == 1 && state.current_layout != layout_index {
-                        need_switch = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Switch layout if needed (before forwarding events)
+        // Switch layout before forwarding events
         if need_switch {
-            let mut state = state.lock().await;
-            if state.current_layout != layout_index {
-                let mode_str = if is_grab_mode { "Grab" } else { "Passive" };
-                info!(
-                    "[{}] Switching layout to {} (index {}) - input from '{}'",
-                    mode_str, layout_name, layout_index, name
-                );
+            let mode_str = if is_grab_mode { "Grab" } else { "Passive" };
+            info!(
+                "[{}] Switching layout to {} (index {}) - input from '{}'",
+                mode_str, layout_name, layout_index, name
+            );
 
-                match switch_layout(&state.dbus_conn, layout_index).await {
-                    Ok(()) => {
-                        state.current_layout = layout_index;
-                        if is_grab_mode {
-                            // Small delay to ensure layout is applied before forwarding
-                            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to switch layout: {}", e);
-                    }
-                }
+            if let Err(e) = switch_layout(&dbus_conn, layout_index) {
+                error!("Failed to switch layout: {}", e);
+            } else if is_grab_mode {
+                // Small delay to ensure layout is applied
+                thread::sleep(Duration::from_micros(500));
             }
         }
 
-        // Forward all events in grab mode (outside the lock for better performance)
+        // Forward events in grab mode
         if is_grab_mode {
-            let mut state = state.lock().await;
-            // Emit all events at once for better timing
-            if let Err(e) = state.virtual_keyboard.emit(&events) {
+            if let Err(e) = virtual_kb.emit(&events) {
                 error!("Failed to emit events: {}", e);
             }
         }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -362,7 +360,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set initial mode
     let initial_grab = config.mode.to_lowercase() != "passive";
     GRAB_MODE.store(initial_grab, Ordering::SeqCst);
-    info!("Initial mode: {}", if initial_grab { "grab" } else { "passive" });
+    info!(
+        "Initial mode: {}",
+        if initial_grab { "grab" } else { "passive" }
+    );
 
     let keyboards = find_keyboards(&config);
 
@@ -382,46 +383,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No keyboards found".into());
     }
 
-    // Create virtual keyboard for grab mode
-    let virtual_keyboard = create_virtual_keyboard()?;
-    info!("Created virtual keyboard for event forwarding");
-
-    // Set up D-Bus service
-    let _control_conn = ConnectionBuilder::session()?
-        .name("org.kblayout.Daemon")?
-        .serve_at("/org/kblayout/Daemon", DaemonControl)?
-        .build()
-        .await?;
-
-    info!("D-Bus service started at org.kblayout.Daemon");
-
-    let dbus_conn = Connection::session().await?;
-    let current = get_current_layout(&dbus_conn).await.unwrap_or(0);
+    // Set up D-Bus connection for layout switching
+    let dbus_conn = Arc::new(Connection::session()?);
+    let current = get_current_layout(&dbus_conn).unwrap_or(0);
+    CURRENT_LAYOUT.store(current, Ordering::SeqCst);
     info!("Current layout index: {}", current);
 
-    let state = Arc::new(Mutex::new(SharedState {
-        current_layout: current,
-        dbus_conn,
-        virtual_keyboard,
-    }));
+    // Start D-Bus service in separate thread
+    thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
+        rt.block_on(async {
+            let _conn = zbus::ConnectionBuilder::session()
+                .unwrap()
+                .name("org.kblayout.Daemon")
+                .unwrap()
+                .serve_at("/org/kblayout/Daemon", DaemonControl)
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+
+            info!("D-Bus service started at org.kblayout.Daemon");
+
+            // Keep the connection alive
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            }
+        });
+    });
+
+    // Give D-Bus service time to start
+    thread::sleep(Duration::from_millis(100));
+
+    info!("Monitoring keyboards... Press Ctrl+C to stop.");
+    info!("Toggle mode: dbus-send --session --print-reply --dest=org.kblayout.Daemon /org/kblayout/Daemon org.kblayout.Daemon.ToggleMode");
+
+    // Start keyboard monitors
     let mut handles = vec![];
 
     for (path, (name, layout_index, layout_name)) in keyboards {
-        let state = Arc::clone(&state);
+        let dbus_conn = Arc::clone(&dbus_conn);
 
-        let handle = tokio::spawn(async move {
-            monitor_keyboard(path, name, layout_index, layout_name, state).await;
+        let handle = thread::spawn(move || {
+            monitor_keyboard(path, name, layout_index, layout_name, dbus_conn);
         });
 
         handles.push(handle);
     }
 
-    info!("Monitoring keyboards... Press Ctrl+C to stop.");
-    info!("Toggle mode: dbus-send --session --print-reply --dest=org.kblayout.Daemon /org/kblayout/Daemon org.kblayout.Daemon.ToggleMode");
-
+    // Wait for all threads
     for handle in handles {
-        let _ = handle.await;
+        let _ = handle.join();
     }
 
     Ok(())
