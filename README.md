@@ -7,7 +7,10 @@ Perfect for users with multiple keyboards who want different layouts for each (e
 ## Features
 
 - Monitors multiple keyboards simultaneously
-- Switches layout on first keypress (~50-100ms latency)
+- **Two modes:**
+  - **Grab mode**: Correct layout on first keystroke (~1ms latency)
+  - **Passive mode**: Zero latency (first key after switch may use old layout)
+- Toggle between modes via D-Bus or KDE Plasma widget
 - Native D-Bus integration with KDE Plasma
 - Minimal resource usage (~2MB RAM, <1% CPU)
 - Single static binary, no runtime dependencies
@@ -34,7 +37,7 @@ sudo cp target/release/kb-layout-daemon /usr/local/bin/
 ### Arch Linux (AUR)
 
 ```bash
-yay -S kb-layout-daemon
+yay -S kb-layout-daemon-git
 ```
 
 ### From crates.io
@@ -53,6 +56,9 @@ cargo install kb-layout-daemon
 
 2. Create config file at `~/.config/kb-layout-daemon/config.toml`:
    ```toml
+   # Mode: "grab" (correct first key) or "passive" (zero latency)
+   mode = "grab"
+
    [[keyboards]]
    name = "Lofree"
    layout_index = 1
@@ -73,9 +79,50 @@ cargo install kb-layout-daemon
    systemctl --user enable --now kb-layout-daemon
    ```
 
+## KDE Plasma Widget
+
+A panel widget is included to toggle between Grab and Passive modes.
+
+### Install the widget
+
+```bash
+cp -r widget ~/.local/share/plasma/plasmoids/org.kblayout.toggle
+```
+
+Then right-click your panel → "Add Widgets" → search for "KB Layout Mode" → drag to panel.
+
+- **Green "KB"**: Grab mode (correct first key, ~1ms latency)
+- **Red "GM"**: Passive/Game mode (zero latency)
+
+Click to toggle between modes.
+
+## D-Bus Interface
+
+Control the daemon via D-Bus at `org.kblayout.Daemon`:
+
+```bash
+# Get current mode
+dbus-send --session --print-reply --dest=org.kblayout.Daemon \
+  /org/kblayout/Daemon org.kblayout.Daemon.GetMode
+
+# Set mode
+dbus-send --session --print-reply --dest=org.kblayout.Daemon \
+  /org/kblayout/Daemon org.kblayout.Daemon.SetMode string:"passive"
+
+# Toggle mode
+dbus-send --session --print-reply --dest=org.kblayout.Daemon \
+  /org/kblayout/Daemon org.kblayout.Daemon.ToggleMode
+```
+
 ## Configuration
 
-The config file uses TOML format. Each `[[keyboards]]` section defines a keyboard to monitor:
+The config file uses TOML format:
+
+| Field | Description |
+|-------|-------------|
+| `mode` | Initial mode: `"grab"` or `"passive"` (default: `"grab"`) |
+
+Each `[[keyboards]]` section defines a keyboard to monitor:
 
 | Field | Description |
 |-------|-------------|
@@ -91,9 +138,13 @@ cat /proc/bus/input/devices | grep -A 4 "Name="
 ## How It Works
 
 1. On startup, scans `/dev/input/event*` for keyboards matching configured names
-2. Uses async I/O (tokio + evdev) to monitor all keyboards concurrently
+2. Monitors all keyboards using evdev
 3. On keypress, checks if layout switch is needed
 4. Switches layout via D-Bus call to `org.kde.keyboard`
+
+**Grab mode**: Grabs exclusive access to keyboards, intercepts all input, switches layout, then forwards events through a virtual keyboard. This ensures the first keystroke uses the correct layout.
+
+**Passive mode**: Monitors keyboards without grabbing. Layout switches after detecting a keypress, so the first key may use the old layout. Zero added latency.
 
 ## Troubleshooting
 
@@ -105,6 +156,10 @@ cat /proc/bus/input/devices | grep -A 4 "Name="
 - Check KDE has multiple layouts configured
 - Verify `layout_index` matches your KDE layout order
 - Check logs: `journalctl --user -u kb-layout-daemon -f`
+
+**Keys not working in Grab mode**
+- Try switching to Passive mode: `dbus-send --session --print-reply --dest=org.kblayout.Daemon /org/kblayout/Daemon org.kblayout.Daemon.SetMode string:"passive"`
+- Report the issue with your keyboard model
 
 ## License
 
