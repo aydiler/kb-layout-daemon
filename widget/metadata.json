@@ -1,0 +1,18 @@
+{
+    "KPlugin": {
+        "Id": "org.kblayout.toggle",
+        "Name": "KB Layout Mode",
+        "Description": "Toggle keyboard layout daemon mode between Grab and Passive",
+        "Icon": "input-keyboard",
+        "Authors": [
+            {
+                "Name": "aydiler"
+            }
+        ],
+        "Category": "Utilities",
+        "License": "MIT",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "KPackageStructure": "Plasma/Applet"
+}
