@@ -16,6 +16,7 @@ Perfect for users with multiple keyboards who want different layouts for each (e
 - Single static binary, no runtime dependencies
 - Configurable via TOML file
 - Systemd user service included
+- KDE Plasma widget available on [KDE Store](https://store.kde.org/p/2342747/)
 
 ## Requirements
 
