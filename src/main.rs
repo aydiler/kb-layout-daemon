@@ -1,7 +1,7 @@
 use evdev::{uinput::VirtualDeviceBuilder, AttributeSet, Device, EventType, InputEvent, InputEventKind, Key, MiscType, RelativeAxisType};
 use futures::StreamExt;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -171,6 +171,39 @@ fn get_current_layout(conn: &Connection) -> Result<u32, zbus::Error> {
     proxy.call("getLayout", &())
 }
 
+/// Switch layout and wait for KDE to confirm the change.
+/// Polls getLayout() until it matches the target, with a timeout.
+fn switch_layout_confirmed(conn: &Connection, layout_index: u32) -> Result<(), zbus::Error> {
+    switch_layout(conn, layout_index)?;
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(50) {
+        if let Ok(current) = get_current_layout(conn) {
+            if current == layout_index {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_micros(100));
+    }
+
+    // Timeout reached - proceed anyway, layout was set
+    warn!("Layout switch confirmation timeout - proceeding");
+    Ok(())
+}
+
+/// Emit events to virtual keyboard with proper SYN_REPORT synchronization.
+/// The kernel requires SYN_REPORT markers to properly frame event batches.
+fn emit_event_batch(
+    vk: &mut evdev::uinput::VirtualDevice,
+    events: &[InputEvent],
+) -> Result<(), std::io::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    vk.emit(events)?;
+    vk.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)])
+}
+
 fn create_virtual_keyboard() -> Result<evdev::uinput::VirtualDevice, std::io::Error> {
     let mut keys = AttributeSet::<Key>::new();
     // Include all possible key codes (KEY_MAX is typically 767)
@@ -262,6 +295,8 @@ fn monitor_keyboard(
 
     let mut was_grab_mode = GRAB_MODE.load(Ordering::SeqCst);
     let mut device: Option<Device> = None;
+    // Track actually pressed keys to avoid releasing unpressed keys (especially Meta)
+    let mut pressed_keys: HashSet<u16> = HashSet::new();
 
     loop {
         // Check for shutdown signal
@@ -274,17 +309,15 @@ fn monitor_keyboard(
 
         // Handle mode changes - need to re-open device with different grab state
         if device.is_none() || is_grab_mode != was_grab_mode {
-            // Release any held keys before switching
-            if device.is_some() {
-                if was_grab_mode {
-                    // Send key release for all potentially pressed keys
-                    let release_events: Vec<InputEvent> = (0..256u16)
-                        .map(|code| InputEvent::new(EventType::KEY, code, 0))
-                        .collect();
-                    let _ = virtual_kb.emit(&release_events);
-                    // Send SYN
-                    let _ = virtual_kb.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)]);
-                }
+            // Release only actually pressed keys before switching
+            // This avoids sending spurious Meta key releases that trigger KDE launcher
+            if device.is_some() && was_grab_mode && !pressed_keys.is_empty() {
+                let release_events: Vec<InputEvent> = pressed_keys
+                    .iter()
+                    .map(|&code| InputEvent::new(EventType::KEY, code, 0))
+                    .collect();
+                let _ = emit_event_batch(&mut virtual_kb, &release_events);
+                pressed_keys.clear();
             }
             device = None;
 
@@ -335,15 +368,25 @@ fn monitor_keyboard(
             }
         };
 
-        // Check if we need to switch layout (on key press)
+        // Check if we need to switch layout (on key press) and track pressed keys
         let current = CURRENT_LAYOUT.load(Ordering::SeqCst);
         let mut need_switch = false;
 
         for ev in &events {
-            if let InputEventKind::Key(_) = ev.kind() {
-                if ev.value() == 1 && current != layout_index {
-                    need_switch = true;
-                    break;
+            if let InputEventKind::Key(key) = ev.kind() {
+                match ev.value() {
+                    1 => {
+                        // Key press
+                        pressed_keys.insert(key.code());
+                        if current != layout_index {
+                            need_switch = true;
+                        }
+                    }
+                    0 => {
+                        // Key release
+                        pressed_keys.remove(&key.code());
+                    }
+                    _ => {} // Key repeat (value=2) - ignore for tracking
                 }
             }
         }
@@ -356,17 +399,15 @@ fn monitor_keyboard(
                 mode_str, layout_name, layout_index, name
             );
 
-            if let Err(e) = switch_layout(&dbus_conn, layout_index) {
+            // Use confirmed switch to wait for KDE to apply the layout
+            if let Err(e) = switch_layout_confirmed(&dbus_conn, layout_index) {
                 error!("Failed to switch layout: {}", e);
-            } else if is_grab_mode {
-                // Small delay to ensure layout is applied
-                thread::sleep(Duration::from_micros(500));
             }
         }
 
-        // Forward events in grab mode
+        // Forward events in grab mode with proper SYN_REPORT synchronization
         if is_grab_mode {
-            if let Err(e) = virtual_kb.emit(&events) {
+            if let Err(e) = emit_event_batch(&mut virtual_kb, &events) {
                 error!("Failed to emit events: {}", e);
             }
         }
