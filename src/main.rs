@@ -1,11 +1,14 @@
 use evdev::{uinput::VirtualDeviceBuilder, AttributeSet, Device, EventType, InputEvent, InputEventKind, Key, MiscType, RelativeAxisType};
+use futures::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio_udev::{AsyncMonitorSocket, MonitorBuilder};
 use tracing::{error, info, warn};
 use zbus::{blocking::Connection, interface};
 
@@ -49,6 +52,28 @@ impl Default for Config {
             mode: "grab".to_string(),
         }
     }
+}
+
+// Track active keyboard monitors for hot-plug support
+struct KeyboardMonitor {
+    #[allow(dead_code)] // May be used for graceful shutdown in the future
+    handle: JoinHandle<()>,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+type ActiveMonitors = Arc<std::sync::Mutex<HashMap<PathBuf, KeyboardMonitor>>>;
+
+// Check if a device matches any configured keyboard
+fn match_keyboard_config<'a>(device: &Device, config: &'a Config) -> Option<&'a KeyboardConfig> {
+    let name = device.name().unwrap_or("Unknown");
+
+    if !device.supported_events().contains(EventType::KEY) {
+        return None;
+    }
+
+    config.keyboards.iter().find(|kb| {
+        name.to_lowercase().contains(&kb.name.to_lowercase())
+    })
 }
 
 fn load_config() -> Config {
@@ -222,6 +247,7 @@ fn monitor_keyboard(
     layout_index: u32,
     layout_name: String,
     dbus_conn: Arc<Connection>,
+    shutdown_rx: watch::Receiver<bool>,
 ) {
     info!("Starting monitor for '{}' at {:?}", name, path);
 
@@ -238,12 +264,18 @@ fn monitor_keyboard(
     let mut device: Option<Device> = None;
 
     loop {
+        // Check for shutdown signal
+        if *shutdown_rx.borrow() {
+            info!("Shutdown signal received for '{}', stopping monitor", name);
+            break;
+        }
+
         let is_grab_mode = GRAB_MODE.load(Ordering::SeqCst);
 
         // Handle mode changes - need to re-open device with different grab state
         if device.is_none() || is_grab_mode != was_grab_mode {
             // Release any held keys before switching
-            if let Some(ref mut dev) = device {
+            if device.is_some() {
                 if was_grab_mode {
                     // Send key release for all potentially pressed keys
                     let release_events: Vec<InputEvent> = (0..256u16)
@@ -253,7 +285,6 @@ fn monitor_keyboard(
                     // Send SYN
                     let _ = virtual_kb.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)]);
                 }
-                drop(dev);
             }
             device = None;
 
@@ -298,11 +329,9 @@ fn monitor_keyboard(
             Some(e) if !e.is_empty() => e,
             Some(_) => continue,
             None => {
-                // Device disconnected or error
-                warn!("Error reading from '{}', reconnecting...", name);
-                device = None;
-                thread::sleep(Duration::from_secs(1));
-                continue;
+                // Device disconnected - exit thread, udev will respawn if device reconnects
+                info!("Device '{}' disconnected, stopping monitor", name);
+                break;
             }
         };
 
@@ -344,6 +373,145 @@ fn monitor_keyboard(
     }
 }
 
+// Spawn a keyboard monitor thread with shutdown signaling
+fn spawn_keyboard_monitor(
+    path: PathBuf,
+    name: String,
+    layout_index: u32,
+    layout_name: String,
+    dbus_conn: Arc<Connection>,
+    monitors: &ActiveMonitors,
+) {
+    let mut monitors_guard = monitors.lock().unwrap();
+
+    // Don't spawn if already monitoring this path
+    if monitors_guard.contains_key(&path) {
+        return;
+    }
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let path_clone = path.clone();
+
+    let handle = thread::spawn(move || {
+        monitor_keyboard(path_clone, name, layout_index, layout_name, dbus_conn, shutdown_rx);
+    });
+
+    monitors_guard.insert(
+        path,
+        KeyboardMonitor {
+            handle,
+            shutdown_tx,
+        },
+    );
+}
+
+// Stop a keyboard monitor
+fn stop_keyboard_monitor(path: &PathBuf, monitors: &ActiveMonitors) {
+    let mut monitors_guard = monitors.lock().unwrap();
+
+    if let Some(monitor) = monitors_guard.remove(path) {
+        // Signal shutdown
+        let _ = monitor.shutdown_tx.send(true);
+        // Don't wait for thread - it will exit on its own
+    }
+}
+
+// Udev monitor for hot-plug detection
+async fn run_udev_monitor(config: Arc<Config>, dbus_conn: Arc<Connection>, monitors: ActiveMonitors) {
+    let builder = match MonitorBuilder::new() {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to create udev monitor builder: {}", e);
+            return;
+        }
+    };
+
+    let builder = match builder.match_subsystem("input") {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to set subsystem filter: {}", e);
+            return;
+        }
+    };
+
+    let socket = match builder.listen() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to start udev listener: {}", e);
+            return;
+        }
+    };
+
+    let mut async_monitor = match AsyncMonitorSocket::new(socket) {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Failed to create async monitor: {}", e);
+            return;
+        }
+    };
+
+    info!("Udev monitor started - hot-plug detection enabled");
+
+    while let Some(event) = async_monitor.next().await {
+        let event = match event {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Udev event error: {}", e);
+                continue;
+            }
+        };
+
+        let devnode = match event.devnode() {
+            Some(p) => p.to_path_buf(),
+            None => continue,
+        };
+
+        // Only handle /dev/input/event* devices
+        if !devnode.to_string_lossy().contains("/dev/input/event") {
+            continue;
+        }
+
+        match event.event_type() {
+            tokio_udev::EventType::Add | tokio_udev::EventType::Bind => {
+                // Small delay to let device settle
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                // Try to open and check if it matches config
+                if let Ok(device) = Device::open(&devnode) {
+                    if let Some(kb_config) = match_keyboard_config(&device, &config) {
+                        let name = device.name().unwrap_or("Unknown").to_string();
+                        info!(
+                            "Hot-plug: Found keyboard '{}' at {:?} -> {} (index {})",
+                            name, devnode, kb_config.layout_name, kb_config.layout_index
+                        );
+                        spawn_keyboard_monitor(
+                            devnode,
+                            name,
+                            kb_config.layout_index,
+                            kb_config.layout_name.clone(),
+                            Arc::clone(&dbus_conn),
+                            &monitors,
+                        );
+                    }
+                }
+            }
+            tokio_udev::EventType::Remove | tokio_udev::EventType::Unbind => {
+                // Check if we were monitoring this device
+                let was_monitored = {
+                    let guard = monitors.lock().unwrap();
+                    guard.contains_key(&devnode)
+                };
+
+                if was_monitored {
+                    info!("Hot-plug: Device removed at {:?}", devnode);
+                    stop_keyboard_monitor(&devnode, &monitors);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -354,8 +522,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("kb-layout-daemon starting...");
 
-    let config = load_config();
-    info!("Configuration: {:?}", config);
+    let config = Arc::new(load_config());
+    info!("Configuration: {:?}", *config);
 
     // Set initial mode
     let initial_grab = config.mode.to_lowercase() != "passive";
@@ -365,31 +533,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if initial_grab { "grab" } else { "passive" }
     );
 
-    let keyboards = find_keyboards(&config);
-
-    if keyboards.is_empty() {
-        error!("No configured keyboards found! Check your config.");
-        error!("Available input devices:");
-        for entry in std::fs::read_dir("/dev/input")?.flatten() {
-            let path = entry.path();
-            if path.to_string_lossy().contains("event") {
-                if let Ok(device) = Device::open(&path) {
-                    if device.supported_events().contains(EventType::KEY) {
-                        error!("  {:?}: {}", path, device.name().unwrap_or("Unknown"));
-                    }
-                }
-            }
-        }
-        return Err("No keyboards found".into());
-    }
-
     // Set up D-Bus connection for layout switching
     let dbus_conn = Arc::new(Connection::session()?);
     let current = get_current_layout(&dbus_conn).unwrap_or(0);
     CURRENT_LAYOUT.store(current, Ordering::SeqCst);
     info!("Current layout index: {}", current);
 
-    // Start D-Bus service in separate thread
+    // Shared state for active keyboard monitors (for hot-plug support)
+    let monitors: ActiveMonitors = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    // Find and start monitoring initially connected keyboards
+    let keyboards = find_keyboards(&config);
+
+    if keyboards.is_empty() {
+        warn!("No configured keyboards found at startup.");
+        warn!("Available input devices:");
+        for entry in std::fs::read_dir("/dev/input")?.flatten() {
+            let path = entry.path();
+            if path.to_string_lossy().contains("event") {
+                if let Ok(device) = Device::open(&path) {
+                    if device.supported_events().contains(EventType::KEY) {
+                        warn!("  {:?}: {}", path, device.name().unwrap_or("Unknown"));
+                    }
+                }
+            }
+        }
+        warn!("Hot-plug detection is active - connect a configured keyboard.");
+    } else {
+        // Spawn monitors for initially connected keyboards
+        for (path, (name, layout_index, layout_name)) in keyboards {
+            spawn_keyboard_monitor(
+                path,
+                name,
+                layout_index,
+                layout_name,
+                Arc::clone(&dbus_conn),
+                &monitors,
+            );
+        }
+    }
+
+    // Start D-Bus service and udev monitor in async runtime
+    let config_for_udev = Arc::clone(&config);
+    let dbus_for_udev = Arc::clone(&dbus_conn);
+    let monitors_for_udev = Arc::clone(&monitors);
+
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -397,6 +585,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap();
 
         rt.block_on(async {
+            // Start D-Bus service
             let _conn = zbus::ConnectionBuilder::session()
                 .unwrap()
                 .name("org.kblayout.Daemon")
@@ -409,10 +598,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             info!("D-Bus service started at org.kblayout.Daemon");
 
-            // Keep the connection alive
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-            }
+            // Run udev monitor (this runs forever)
+            run_udev_monitor(config_for_udev, dbus_for_udev, monitors_for_udev).await;
         });
     });
 
@@ -422,23 +609,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Monitoring keyboards... Press Ctrl+C to stop.");
     info!("Toggle mode: dbus-send --session --print-reply --dest=org.kblayout.Daemon /org/kblayout/Daemon org.kblayout.Daemon.ToggleMode");
 
-    // Start keyboard monitors
-    let mut handles = vec![];
-
-    for (path, (name, layout_index, layout_name)) in keyboards {
-        let dbus_conn = Arc::clone(&dbus_conn);
-
-        let handle = thread::spawn(move || {
-            monitor_keyboard(path, name, layout_index, layout_name, dbus_conn);
-        });
-
-        handles.push(handle);
+    // Keep main thread alive
+    loop {
+        thread::sleep(Duration::from_secs(3600));
     }
-
-    // Wait for all threads
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    Ok(())
 }

@@ -7,8 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build --release          # Build optimized binary
 cargo run                      # Run in debug mode
+cargo clippy                   # Lint
 cargo publish --allow-dirty    # Publish to crates.io
 ```
+
+AUR package: `kb-layout-daemon-git`
 
 ## Testing the Daemon
 
@@ -54,6 +57,11 @@ The virtual keyboard must include MSC_SCAN events and relative axes, otherwise s
 ## Config Location
 
 `~/.config/kb-layout-daemon/config.toml`
+
+Find keyboard device names with:
+```bash
+cat /proc/bus/input/devices | grep -A 4 "Name="
+```
 
 ## KDE Plasma Widget
 
