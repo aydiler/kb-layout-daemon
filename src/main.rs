@@ -191,8 +191,9 @@ fn switch_layout_confirmed(conn: &Connection, layout_index: u32) -> Result<(), z
     Ok(())
 }
 
-/// Emit events to virtual keyboard with proper SYN_REPORT synchronization.
-/// The kernel requires SYN_REPORT markers to properly frame event batches.
+/// Emit events to virtual keyboard.
+/// Events from the physical keyboard already include SYN_REPORT markers,
+/// so we forward them as-is without adding extra synchronization events.
 fn emit_event_batch(
     vk: &mut evdev::uinput::VirtualDevice,
     events: &[InputEvent],
@@ -200,8 +201,7 @@ fn emit_event_batch(
     if events.is_empty() {
         return Ok(());
     }
-    vk.emit(events)?;
-    vk.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)])
+    vk.emit(events)
 }
 
 fn create_virtual_keyboard() -> Result<evdev::uinput::VirtualDevice, std::io::Error> {
@@ -309,14 +309,30 @@ fn monitor_keyboard(
 
         // Handle mode changes - need to re-open device with different grab state
         if device.is_none() || is_grab_mode != was_grab_mode {
+            if is_grab_mode != was_grab_mode {
+                info!(
+                    "'{}' mode changing from {} to {}",
+                    name,
+                    if was_grab_mode { "GRAB" } else { "PASSIVE" },
+                    if is_grab_mode { "GRAB" } else { "PASSIVE" }
+                );
+            }
             // Release only actually pressed keys before switching
             // This avoids sending spurious Meta key releases that trigger KDE launcher
             if device.is_some() && was_grab_mode && !pressed_keys.is_empty() {
+                info!(
+                    "'{}' releasing {} pressed keys before mode switch: {:?}",
+                    name,
+                    pressed_keys.len(),
+                    pressed_keys
+                );
                 let release_events: Vec<InputEvent> = pressed_keys
                     .iter()
                     .map(|&code| InputEvent::new(EventType::KEY, code, 0))
                     .collect();
-                let _ = emit_event_batch(&mut virtual_kb, &release_events);
+                if let Err(e) = emit_event_batch(&mut virtual_kb, &release_events) {
+                    warn!("Failed to release keys during mode switch: {}", e);
+                }
                 pressed_keys.clear();
             }
             device = None;
@@ -350,21 +366,35 @@ fn monitor_keyboard(
         }
 
         // Read events in a block to limit borrow scope
-        let events: Option<Vec<InputEvent>> = {
+        let events_result: Result<Vec<InputEvent>, std::io::Error> = {
             let dev = device.as_mut().unwrap();
-            match dev.fetch_events() {
-                Ok(iter) => Some(iter.collect()),
-                Err(_) => None,
-            }
+            dev.fetch_events().map(|iter| iter.collect())
         };
 
-        let events = match events {
-            Some(e) if !e.is_empty() => e,
-            Some(_) => continue,
-            None => {
-                // Device disconnected - exit thread, udev will respawn if device reconnects
-                info!("Device '{}' disconnected, stopping monitor", name);
-                break;
+        let events = match events_result {
+            Ok(e) if !e.is_empty() => e,
+            Ok(_) => continue, // Empty events, loop again
+            Err(e) => {
+                // Check if it's a real disconnection or a recoverable error
+                if e.raw_os_error() == Some(19) {
+                    // ENODEV - device actually disconnected
+                    info!("Device '{}' disconnected (ENODEV), stopping monitor", name);
+                    break;
+                } else if e.raw_os_error() == Some(11) {
+                    // EAGAIN - would block, just continue (shouldn't happen with blocking read)
+                    continue;
+                } else {
+                    // Log other errors and try to recover by re-opening device
+                    warn!(
+                        "Error reading from '{}': {} (os error: {:?}), re-opening device",
+                        name,
+                        e,
+                        e.raw_os_error()
+                    );
+                    device = None; // Force device re-open on next iteration
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
             }
         };
 
@@ -391,6 +421,16 @@ fn monitor_keyboard(
             }
         }
 
+        // Sanity check: warn if too many keys are tracked as pressed (possible state corruption)
+        if pressed_keys.len() > 10 {
+            warn!(
+                "'{}' has {} keys tracked as pressed (possible state issue): {:?}",
+                name,
+                pressed_keys.len(),
+                pressed_keys
+            );
+        }
+
         // Switch layout before forwarding events
         if need_switch {
             let mode_str = if is_grab_mode { "Grab" } else { "Passive" };
@@ -405,10 +445,25 @@ fn monitor_keyboard(
             }
         }
 
-        // Forward events in grab mode with proper SYN_REPORT synchronization
+        // Forward events in grab mode
         if is_grab_mode {
             if let Err(e) = emit_event_batch(&mut virtual_kb, &events) {
-                error!("Failed to emit events: {}", e);
+                error!("Failed to emit events for '{}': {}", name, e);
+                // Try to recover by recreating the virtual keyboard
+                warn!("Attempting to recreate virtual keyboard for '{}'", name);
+                match create_virtual_keyboard() {
+                    Ok(new_vk) => {
+                        virtual_kb = new_vk;
+                        info!("Successfully recreated virtual keyboard for '{}'", name);
+                        // Retry emitting events with new virtual keyboard
+                        if let Err(e2) = emit_event_batch(&mut virtual_kb, &events) {
+                            error!("Still failed to emit events after recreating vk: {}", e2);
+                        }
+                    }
+                    Err(e2) => {
+                        error!("Failed to recreate virtual keyboard: {}", e2);
+                    }
+                }
             }
         }
     }
