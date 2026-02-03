@@ -1,1 +1,8 @@
 /target
+
+# Node.js (widget build)
+node_modules/
+dist/
+
+# Screenshots
+*.png
